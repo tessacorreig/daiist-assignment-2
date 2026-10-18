@@ -4,8 +4,10 @@ Assignment 2: training pipeline.
 Stage 1: download the dataset from Roboflow Universe.
 Stage 2: describe the dataset (counts per class and split, object size).
 Stage 3: finetune yolo11n on it.
+Stage 4: evaluate on the test split against two baselines.
 
-Quick timing test:  QUICK=1 uv run python main.py train
+Quick timing test:      QUICK=1 uv run python main.py train
+Reuse existing weights: SKIP_TRAINING=1 uv run python main.py train
 """
 
 # Make Python trust the same certificates as the Mac. This must come first.
@@ -26,6 +28,8 @@ from roboflow import Roboflow
 from ultralytics import YOLO
 
 from api_key import load_api_key
+from costing import run_costing
+from review import run_review
 
 # The exact dataset version we use (also written in REPORT.md).
 WORKSPACE = "defect-5hwax"
@@ -37,6 +41,7 @@ WEIGHTS_DIR = Path("weights")
 
 # Training settings. QUICK=1 is only a short test to measure speed.
 QUICK = os.environ.get("QUICK") == "1"
+SKIP_TRAINING = os.environ.get("SKIP_TRAINING") == "1"
 MODEL = "yolo11n.pt"
 EPOCHS = 1 if QUICK else 30
 FRACTION = 0.05 if QUICK else 1.0   # share of the training images used
@@ -148,6 +153,124 @@ def train_model(data_yaml):
     return Path(model.trainer.best)
 
 
+def evaluate_finetuned(weights, data_yaml, class_names):
+    """Test our model on the test split: precision, recall and AP per class."""
+    model = YOLO(str(weights))
+    m = model.val(
+        data=str(data_yaml),
+        split="test",
+        imgsz=IMGSZ,
+        batch=BATCH,
+        device=DEVICE,
+        conf=0.001,
+        plots=True,
+        project=str(Path("runs").resolve()),
+        name="test_eval",
+        exist_ok=True,
+        verbose=False,
+    )
+    per_class = {}
+    for i, class_id in enumerate(m.box.ap_class_index):
+        p, r, ap50, ap = m.box.class_result(i)
+        per_class[class_names[int(class_id)]] = {
+            "precision": float(p),
+            "recall": float(r),
+            "ap50": float(ap50),
+            "map50_95": float(ap),
+        }
+    overall = {
+        "precision": float(m.box.mp),
+        "recall": float(m.box.mr),
+        "ap50": float(m.box.map50),
+        "map50_95": float(m.box.map),
+    }
+    OUT_DIR.mkdir(exist_ok=True)
+    for png in ["confusion_matrix.png", "confusion_matrix_normalized.png"]:
+        source = Path(m.save_dir) / png
+        if source.exists():
+            shutil.copy(source, OUT_DIR / f"test_{png}")
+    return {"overall": overall, "per_class": per_class}
+
+
+def evaluate_coco_zero_shot(folder):
+    """Baseline 1: the original COCO model, used as it is.
+
+    COCO knows 80 everyday objects and none of them is a fabric defect, so its
+    AP on our three classes is zero by construction. What we can measure is how
+    often it flags a test image anyway, and with what (wrong) labels.
+    """
+    model = YOLO(MODEL)
+    images = sorted(p for p in (Path(folder) / "test" / "images").iterdir() if p.is_file())
+    boxes = 0
+    images_flagged = 0
+    labels_seen = {}
+    for path in images:
+        # One image per call, so the non-max-suppression time limit cannot drop predictions.
+        result = model.predict(
+            source=str(path), conf=0.25, imgsz=IMGSZ, device=DEVICE, verbose=False
+        )[0]
+        n = len(result.boxes)
+        boxes += n
+        images_flagged += 1 if n else 0
+        for class_id in result.boxes.cls.tolist():
+            label = result.names[int(class_id)]
+            labels_seen[label] = labels_seen.get(label, 0) + 1
+    return {
+        "ap50_on_our_classes": 0.0,
+        "note": "COCO has no defect classes, so AP is zero by construction.",
+        "test_images": len(images),
+        "images_with_any_box": images_flagged,
+        "total_boxes": boxes,
+        "labels_it_used": dict(sorted(labels_seen.items(), key=lambda kv: -kv[1])[:8]),
+    }
+
+def evaluate_predict_nothing(stats):
+    """Baseline 2: a model that never reports a defect."""
+    test = stats["splits"]["test"]
+    return {
+        "ap50": 0.0,
+        "recall": 0.0,
+        "test_images": test["images"],
+        "defective_images_caught": 0,
+        "defective_images_in_test": test["images_with_defects"],
+        "note": "Scores zero on this test set because every test image has a defect.",
+    }
+
+
+def evaluate_all(weights, data_yaml, folder, stats):
+    """Run the finetuned model and both baselines on the test split and save the results."""
+    class_names = stats["class_names"]
+    finetuned = evaluate_finetuned(weights, data_yaml, class_names)
+    coco = evaluate_coco_zero_shot(folder)
+    nothing = evaluate_predict_nothing(stats)
+
+    results = {
+        "weights": str(weights),
+        "finetuned": finetuned,
+        "baseline_coco_zero_shot": coco,
+        "baseline_predict_nothing": nothing,
+    }
+    OUT_DIR.mkdir(exist_ok=True)
+    (OUT_DIR / "test_metrics.json").write_text(json.dumps(results, indent=2))
+
+    print("\n=== TEST SPLIT RESULTS (finetuned model) ===")
+    print(f"{'class':15s} {'precision':>9s} {'recall':>7s} {'AP50':>7s} {'mAP50-95':>9s}")
+    for name, v in finetuned["per_class"].items():
+        print(f"{name:15s} {v['precision']:9.3f} {v['recall']:7.3f} {v['ap50']:7.3f} {v['map50_95']:9.3f}")
+    o = finetuned["overall"]
+    print(f"{'ALL':15s} {o['precision']:9.3f} {o['recall']:7.3f} {o['ap50']:7.3f} {o['map50_95']:9.3f}")
+
+    print("\n=== BASELINE 1: COCO model, zero-shot ===")
+    print(f"AP50 on our classes: {coco['ap50_on_our_classes']} (zero by construction)")
+    print(f"It put boxes on {coco['images_with_any_box']} of {coco['test_images']} test images "
+          f"({coco['total_boxes']} boxes), using labels: {coco['labels_it_used']}")
+
+    print("\n=== BASELINE 2: predict nothing ===")
+    print(f"Defective test images caught: {nothing['defective_images_caught']} of "
+          f"{nothing['defective_images_in_test']}  (AP50 {nothing['ap50']})")
+    print("\nSaved outputs/test_metrics.json")
+
+
 def main():
     print("Training device:", DEVICE)
     folder = download_dataset()
@@ -159,14 +282,24 @@ def main():
     (OUT_DIR / "dataset_stats.json").write_text(json.dumps(stats, indent=2))
 
     data_yaml = write_data_yaml(folder, stats["class_names"])
-    best = train_model(data_yaml)
 
-    if QUICK:
-        print("Quick test only: weights were NOT copied to weights/.")
+    if SKIP_TRAINING:
+        final_weights = WEIGHTS_DIR / "best.pt"
+        print("\nSKIP_TRAINING=1: using existing", final_weights)
     else:
-        WEIGHTS_DIR.mkdir(exist_ok=True)
-        shutil.copy(best, WEIGHTS_DIR / "best.pt")
-        print("Saved weights/best.pt")
+        best = train_model(data_yaml)
+        if QUICK:
+            final_weights = best
+            print("Quick test only: weights were NOT copied to weights/.")
+        else:
+            WEIGHTS_DIR.mkdir(exist_ok=True)
+            shutil.copy(best, WEIGHTS_DIR / "best.pt")
+            final_weights = WEIGHTS_DIR / "best.pt"
+            print("Saved weights/best.pt")
+
+    evaluate_all(final_weights, data_yaml, folder, stats)
+    run_costing(final_weights, folder, DEVICE, IMGSZ, OUT_DIR)
+    run_review(OUT_DIR)
 
 
 if __name__ == "__main__":
